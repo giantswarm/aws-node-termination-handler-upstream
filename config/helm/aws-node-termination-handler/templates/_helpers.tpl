@@ -50,6 +50,7 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
 app.kubernetes.io/part-of: {{ .Release.Name }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
+application.giantswarm.io/team: {{ index .Chart.Annotations "application.giantswarm.io/team" | quote }}
 helm.sh/chart: {{ include "aws-node-termination-handler.chart" . }}
 {{- with .Values.customLabels }}
 {{ toYaml . }}
@@ -111,7 +112,7 @@ Create the name of the service account to use
 The image to use
 */}}
 {{- define "aws-node-termination-handler.image" -}}
-{{- printf "%s:%s" .Values.image.repository (default (printf "v%s" .Chart.AppVersion) .Values.image.tag) }}
+{{- printf "%s/%s:%s" .Values.image.registry .Values.image.name (default (printf "v%s" .Chart.AppVersion) .Values.image.tag) }}
 {{- end }}
 
 {{/* Get PodDisruptionBudget API Version */}}
