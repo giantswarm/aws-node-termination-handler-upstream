@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -59,8 +60,13 @@ const (
 	ASGLifecycleTerminationTaint = "aws-node-termination-handler/asg-lifecycle-termination"
 	// RebalanceRecommendationTaint is a taint used to make spot instance unschedulable
 	RebalanceRecommendationTaint = "aws-node-termination-handler/rebalance-recommendation"
+	// OutOfServiceTaint is a taint used to forcefully evict pods without matching tolerations and detach persistent volumes
+	OutOfServiceTaintKey        = "node.kubernetes.io/out-of-service"
+	OutOfServiceTaintValue      = "nodeshutdown"
+	OutOfServiceTaintEffectType = "NoExecute"
 
 	maxTaintValueLength = 63
+	daemonSet           = "DaemonSet"
 )
 
 const (
@@ -73,6 +79,7 @@ const (
 var (
 	maxRetryDeadline      time.Duration = 5 * time.Second
 	conflictRetryInterval time.Duration = 750 * time.Millisecond
+	instanceIDRegex                     = regexp.MustCompile(`^i-.*`)
 )
 
 // Node represents a kubernetes node with functions to manipulate its state via the kubernetes api server
@@ -144,6 +151,7 @@ func (n Node) CordonAndDrain(nodeName string, reason string, recorder recorderIn
 	}
 	if n.nthConfig.UseAPIServerCacheToListPods {
 		if pods != nil {
+			pods = n.FilterOutDaemonSetPods(pods)
 			err = n.drainHelper.DeleteOrEvictPods(pods.Items)
 		}
 	} else {
@@ -276,6 +284,10 @@ func (n Node) MarkForUncordonAfterReboot(nodeName string) error {
 		return fmt.Errorf("Unable to label node with action time for uncordon after system-reboot: %w", err)
 	}
 	return nil
+}
+
+func (n Node) GetNthConfig() config.Config {
+	return n.nthConfig
 }
 
 // addLabel will add a label to the node given a label key and value
@@ -441,7 +453,7 @@ func (n Node) TaintSpotItn(nodeName string, eventID string) error {
 		eventID = eventID[:maxTaintValueLength]
 	}
 
-	return addTaint(k8sNode, n, SpotInterruptionTaint, eventID)
+	return addTaint(k8sNode, n, SpotInterruptionTaint, eventID, n.nthConfig.TaintEffect)
 }
 
 // TaintASGLifecycleTermination adds the spot termination notice taint onto a node
@@ -459,7 +471,7 @@ func (n Node) TaintASGLifecycleTermination(nodeName string, eventID string) erro
 		eventID = eventID[:maxTaintValueLength]
 	}
 
-	return addTaint(k8sNode, n, ASGLifecycleTerminationTaint, eventID)
+	return addTaint(k8sNode, n, ASGLifecycleTerminationTaint, eventID, n.nthConfig.TaintEffect)
 }
 
 // TaintRebalanceRecommendation adds the rebalance recommendation notice taint onto a node
@@ -477,7 +489,7 @@ func (n Node) TaintRebalanceRecommendation(nodeName string, eventID string) erro
 		eventID = eventID[:maxTaintValueLength]
 	}
 
-	return addTaint(k8sNode, n, RebalanceRecommendationTaint, eventID)
+	return addTaint(k8sNode, n, RebalanceRecommendationTaint, eventID, n.nthConfig.TaintEffect)
 }
 
 // LogPods logs all the pod names on a node
@@ -519,7 +531,21 @@ func (n Node) TaintScheduledMaintenance(nodeName string, eventID string) error {
 		eventID = eventID[:maxTaintValueLength]
 	}
 
-	return addTaint(k8sNode, n, ScheduledMaintenanceTaint, eventID)
+	return addTaint(k8sNode, n, ScheduledMaintenanceTaint, eventID, n.nthConfig.TaintEffect)
+}
+
+// TaintOutOfService adds the out-of-service taint (NoExecute) onto a node
+func (n Node) TaintOutOfService(nodeName string) error {
+	if !n.nthConfig.EnableOutOfServiceTaint || n.nthConfig.CordonOnly {
+		return nil
+	}
+
+	k8sNode, err := n.fetchKubernetesNode(nodeName)
+	if err != nil {
+		return fmt.Errorf("Unable to fetch kubernetes node from API: %w", err)
+	}
+
+	return addTaint(k8sNode, n, OutOfServiceTaintKey, OutOfServiceTaintValue, OutOfServiceTaintEffectType)
 }
 
 // RemoveNTHTaints removes NTH-specific taints from a node
@@ -633,6 +659,43 @@ func (n Node) fetchKubernetesNode(nodeName string) (*corev1.Node, error) {
 	return &matchingNodes.Items[0], nil
 }
 
+// fetchKubernetesNode will send an http request to the k8s api server and return list of AWS EC2 instance id
+func (n Node) FetchKubernetesNodeInstanceIds() ([]string, error) {
+	ids := []string{}
+
+	if n.nthConfig.DryRun {
+		log.Info().Msgf("Would have retrieved nodes, but dry-run flag was set")
+		return ids, nil
+	}
+	matchingNodes, err := n.drainHelper.Client.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		log.Warn().Msgf("Unable to list Nodes")
+		return nil, err
+	}
+
+	if matchingNodes == nil || matchingNodes.Items == nil {
+		return nil, fmt.Errorf("list nodes success but return empty response")
+	}
+
+	for _, node := range matchingNodes.Items {
+		// sample providerID: aws:///us-west-2a/i-0abcd1234efgh5678
+		parts := strings.Split(node.Spec.ProviderID, "/")
+		if len(parts) != 5 {
+			log.Warn().Msgf("Invalid providerID format found for node %s: %s (expected format: aws:///region/instance-id)", node.Name, node.Spec.ProviderID)
+			continue
+		}
+
+		instanceId := parts[len(parts)-1]
+		if instanceIDRegex.MatchString(instanceId) {
+			ids = append(ids, parts[len(parts)-1])
+		} else {
+			log.Warn().Msgf("Invalid instance id format found for node %s: %s (expected format: ^i-.*)", node.Name, instanceId)
+		}
+	}
+
+	return ids, nil
+}
+
 func (n Node) fetchAllPods(nodeName string) (*corev1.PodList, error) {
 	if n.nthConfig.DryRun {
 		log.Info().Msgf("Would have retrieved running pod list on node %s, but dry-run flag was set", nodeName)
@@ -645,6 +708,23 @@ func (n Node) fetchAllPods(nodeName string) (*corev1.PodList, error) {
 		listOptions.ResourceVersion = "0"
 	}
 	return n.drainHelper.Client.CoreV1().Pods("").List(context.TODO(), listOptions)
+}
+
+// FilterOutDaemonSetPods filters a list of pods to exclude DaemonSet pods when IgnoreDaemonSets is enabled
+func (n *Node) FilterOutDaemonSetPods(pods *corev1.PodList) *corev1.PodList {
+	if !n.nthConfig.IgnoreDaemonSets {
+		return pods
+	}
+
+	var nonDaemonSetPods []corev1.Pod
+	for _, pod := range pods.Items {
+		if !isDaemonSetPod(pod) {
+			nonDaemonSetPods = append(nonDaemonSetPods, pod)
+		}
+	}
+
+	pods.Items = nonDaemonSetPods
+	return pods
 }
 
 func getDrainHelper(nthConfig config.Config, clientset *kubernetes.Clientset) (*drain.Helper, error) {
@@ -688,8 +768,8 @@ func getTaintEffect(effect string) corev1.TaintEffect {
 	}
 }
 
-func addTaint(node *corev1.Node, nth Node, taintKey string, taintValue string) error {
-	effect := getTaintEffect(nth.nthConfig.TaintEffect)
+func addTaint(node *corev1.Node, nth Node, taintKey string, taintValue string, effectType string) error {
+	effect := getTaintEffect(effectType)
 	if nth.nthConfig.DryRun {
 		log.Info().Msgf("Would have added taint (%s=%s:%s) to node %s, but dry-run flag was set", taintKey, taintValue, effect, nth.nthConfig.NodeName)
 		return nil
@@ -836,6 +916,15 @@ func filterPodForDeletion(podName, podNamespace string) func(pod corev1.Pod) dra
 		}
 		return drain.MakePodDeleteStatusOkay()
 	}
+}
+
+func isDaemonSetPod(pod corev1.Pod) bool {
+	for _, owner := range pod.OwnerReferences {
+		if owner.Kind == daemonSet {
+			return true
+		}
+	}
+	return false
 }
 
 type recorderInterface interface {

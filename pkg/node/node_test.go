@@ -15,6 +15,7 @@ package node_test
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -26,6 +27,7 @@ import (
 	"github.com/aws/aws-node-termination-handler/pkg/node"
 	h "github.com/aws/aws-node-termination-handler/pkg/test"
 	"github.com/aws/aws-node-termination-handler/pkg/uptime"
+	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
@@ -34,7 +36,14 @@ import (
 )
 
 // Size of the fakeRecorder buffer
-const recorderBufferSize = 10
+const (
+	recorderBufferSize = 10
+	instanceId1        = "i-0abcd1234efgh5678"
+	instanceId2        = "i-0wxyz5678ijkl1234"
+)
+
+const outOfServiceTaintKey = "node.kubernetes.io/out-of-service"
+const outOfServiceTaintValue = "nodeshutdown"
 
 var nodeName = "NAME"
 
@@ -376,4 +385,160 @@ func TestUncordonIfRebootedTimeParseFailure(t *testing.T) {
 	tNode := getNode(t, getDrainHelper(client))
 	err = tNode.UncordonIfRebooted(nodeName)
 	h.Assert(t, err != nil, "Failed to return error on UncordonIfReboted failure to parse time")
+}
+
+func TestFetchKubernetesNodeInstanceIds(t *testing.T) {
+	client := fake.NewSimpleClientset(
+		&v1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+			Spec:       v1.NodeSpec{ProviderID: fmt.Sprintf("aws:///us-west-2a/%s", instanceId1)},
+		},
+		&v1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-2"},
+			Spec:       v1.NodeSpec{ProviderID: fmt.Sprintf("aws:///us-west-2a/%s", instanceId2)},
+		},
+	)
+
+	_, err := client.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+	h.Ok(t, err)
+
+	node, err := newNode(config.Config{}, client)
+	h.Ok(t, err)
+
+	instanceIds, err := node.FetchKubernetesNodeInstanceIds()
+	h.Ok(t, err)
+	h.Equals(t, 2, len(instanceIds))
+	h.Equals(t, instanceId1, instanceIds[0])
+	h.Equals(t, instanceId2, instanceIds[1])
+}
+
+func TestFetchKubernetesNodeInstanceIdsEmptyResponse(t *testing.T) {
+	client := fake.NewSimpleClientset()
+
+	_, err := client.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+	h.Ok(t, err)
+
+	node, err := newNode(config.Config{}, client)
+	h.Ok(t, err)
+
+	_, err = node.FetchKubernetesNodeInstanceIds()
+	h.Nok(t, err)
+}
+
+func TestFetchKubernetesNodeInstanceIdsInvalidProviderID(t *testing.T) {
+	client := fake.NewSimpleClientset(
+		&v1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "invalid-providerId-1"},
+			Spec:       v1.NodeSpec{ProviderID: "dummyProviderId"},
+		},
+		&v1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "invalid-providerId-2"},
+			Spec:       v1.NodeSpec{ProviderID: fmt.Sprintf("aws:/%s", instanceId2)},
+		},
+		&v1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "invalid-providerId-3"},
+			Spec:       v1.NodeSpec{ProviderID: fmt.Sprintf("us-west-2a/%s", instanceId2)},
+		},
+		&v1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "invalid-providerId-4"},
+			Spec:       v1.NodeSpec{ProviderID: fmt.Sprintf("aws:///us-west-2a/%s/dummyPart", instanceId2)},
+		},
+		&v1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "valid-providerId-2"},
+			Spec:       v1.NodeSpec{ProviderID: fmt.Sprintf("aws:///us-west-2a/%s", instanceId2)},
+		},
+		&v1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "valid-providerId-1"},
+			Spec:       v1.NodeSpec{ProviderID: fmt.Sprintf("aws:///us-west-2a/%s", instanceId1)},
+		},
+	)
+
+	_, err := client.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+	h.Ok(t, err)
+
+	node, err := newNode(config.Config{}, client)
+	h.Ok(t, err)
+
+	instanceIds, err := node.FetchKubernetesNodeInstanceIds()
+	h.Ok(t, err)
+	h.Equals(t, 2, len(instanceIds))
+	h.Equals(t, instanceId1, instanceIds[0])
+	h.Equals(t, instanceId2, instanceIds[1])
+}
+
+func TestFilterOutDaemonSetPods(t *testing.T) {
+	tNode, err := newNode(config.Config{IgnoreDaemonSets: true}, fake.NewSimpleClientset())
+	h.Ok(t, err)
+
+	mockPodList := &corev1.PodList{
+		Items: []corev1.Pod{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "mock-daemon-pod",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Kind: "DaemonSet",
+							Name: "daemon-1",
+						},
+					},
+				},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "mock-replica-pod",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Kind: "ReplicaSet",
+							Name: "replica-1",
+						},
+					},
+				},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "mock-regular-pod",
+				},
+			},
+		},
+	}
+
+	filteredMockPodList := tNode.FilterOutDaemonSetPods(mockPodList)
+	h.Equals(t, 2, len(filteredMockPodList.Items))
+}
+
+func TestTaintOutOfService(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	_, err := client.CoreV1().Nodes().Create(
+		context.Background(),
+		&v1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName},
+		},
+		metav1.CreateOptions{})
+	h.Ok(t, err)
+
+	tNode, err := newNode(config.Config{EnableOutOfServiceTaint: true}, client)
+	h.Ok(t, err)
+	h.Equals(t, true, tNode.GetNthConfig().EnableOutOfServiceTaint)
+	h.Equals(t, false, tNode.GetNthConfig().CordonOnly)
+
+	err = tNode.TaintOutOfService(nodeName)
+	h.Ok(t, err)
+
+	updatedNode, err := client.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+	h.Ok(t, err)
+	taintFound := false
+	expectedTaint := v1.Taint{
+		Key:    outOfServiceTaintKey,
+		Value:  outOfServiceTaintValue,
+		Effect: corev1.TaintEffectNoExecute,
+	}
+	for _, taint := range updatedNode.Spec.Taints {
+		if taint.Key == expectedTaint.Key &&
+			taint.Value == expectedTaint.Value &&
+			taint.Effect == expectedTaint.Effect {
+			taintFound = true
+			break
+		}
+	}
+	h.Equals(t, true, taintFound)
 }

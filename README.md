@@ -48,13 +48,17 @@ Both modes (IMDS and Queue Processor) monitor for events affecting your EC2 inst
 - Webhook feature to send shutdown or restart notification messages
 - Unit & integration tests
 
-### Instance Metadata Service Processor
+### Instance Metadata Service (IMDS) Processor
 Must be deployed as a Kubernetes **DaemonSet**.
 
 - Monitors EC2 Instance Metadata for:
    - [Spot Instance Termination Notifications](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/spot-instance-termination-notices.html)
    - [Scheduled Events](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/monitoring-instances-status-check_sched.html)
    - [Instance Rebalance Recommendations](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/rebalance-recommendations.html)
+   - [Autoscaling Group Target Lifecycle State changes](https://docs.aws.amazon.com/autoscaling/ec2/userguide/retrieving-target-lifecycle-state-through-imds.html)
+
+#### IMDS Processor with ASG Target Lifecycle State change
+Please note that IMDS does **not** support lifecycle *hooks*, but it does support lifecycle *state* change. When using IMDS mode with the ASG target lifecycle state, ASG will update instance metadata to be **Terminated** before it terminates the node. NTH will monitor the path latest/meta-data/autoscaling/target-lifecycle-state for changes and will cordon and drain when the target state is set to **Terminated**.
 
 ### Queue Processor
 Must be deployed as a Kubernetes **Deployment**. Also requires some **additional infrastructure setup** (including SQS queue, EventBridge rules).
@@ -77,25 +81,99 @@ When using the ASG Lifecycle Hooks, ASG first sends the lifecycle action notific
 #### Queue Processor with Instance State Change Events
 When using the EC2 Console or EC2 API to terminate the instance, a state-change notification is sent and the instance termination is started. EC2 does not wait for a "continue" signal before beginning to terminate the instance. When you terminate an EC2 instance, it should trigger a graceful operating system shutdown which will send a SIGTERM to the kubelet, which will in-turn start shutting down pods by propagating that SIGTERM to the containers on the node. If the containers do not shut down by the kubelet's `podTerminationGracePeriod (k8s default is 30s)`, then it will send a SIGKILL to forcefully terminate the containers. Setting the `podTerminationGracePeriod` to a max of 90sec (probably a bit less than that) will delay the termination of pods, which helps in graceful shutdown.
 
+#### Issuing Lifecycle Heartbeats
+
+You can set NTH to send heartbeats to ASG in Queue Processor mode. This allows for a much longer grace period (up to 48 hours) for termination than the maximum heartbeat timeout of two hours. The feature is useful when pods require long time to drain or when you need a shorter heartbeat timeout with a longer grace period.
+
+##### How it works
+
+- When NTH receives an ASG lifecycle termination event, it starts sending heartbeats to ASG to renew the heartbeat timeout associated with the ASG's termination lifecycle hook.
+- The heartbeat timeout acts as a timer that starts when the termination event begins.
+- Before the timeout reaches zero, the termination process is halted at the `Terminating:Wait` stage.
+- By issuing heartbeats, graceful termination duration can be extended up to 48 hours, limited by the global timeout.
+
+##### How to use
+
+- Configure a termination lifecycle hook on ASG (required). Set the heartbeat timeout value to be longer than the `Heartbeat Interval`. Each heartbeat signal resets this timeout, extending the duration that an instance remains in the `Terminating:Wait` state. Without this lifecycle hook, the instance will terminate immediately when termination event occurs.
+- Configure `Heartbeat Interval` (required) and `Heartbeat Until` (optional). NTH operates normally without heartbeats if neither value is set. If only the interval is specified, `Heartbeat Until` defaults to 172800 seconds (48 hours) and heartbeats will be sent. `Heartbeat Until` must be provided with a valid `Heartbeat Interval`, otherwise NTH will fail to start. Any invalid values (wrong type or out of range) will also prevent NTH from starting.
+
+##### Configurations
+###### `Heartbeat Interval` (Required)
+- Time period between consecutive heartbeat signals (in seconds)
+- Specifying this value triggers heartbeat
+- Range: 30 to 3600 seconds (30 seconds to 1 hour)
+- Flag for custom resource definition by *.yaml / helm: `heartbeatInterval`
+- CLI flag: `heartbeat-interval`
+- Default value: X
+
+###### `Heartbeat Until` (Optional)
+- Duration over which heartbeat signals are sent (in seconds)
+- Must be provided with a valid `Heartbeat Interval`
+- Range: 60 to 172800 seconds (1 minute to 48 hours)
+- Flag for custom resource definition by *.yaml / helm: `heartbeatUntil`
+- CLI flag: `heartbeat-until`
+- Default value: 172800 (48 hours)
+
+###### Example Case
+
+- `Heartbeat Interval`: 1000 seconds
+- `Heartbeat Until`: 4500 seconds
+- `Heartbeat Timeout`: 3000 seconds 
+
+| Time (s) | Event | Heartbeat Timeout (HT) | Heartbeat Until (HU) | Action |
+|----------|-------------|------------------|----------------------|--------|
+| 0        | Start       | 3000            | 4500                  | Termination Event Received |
+| 1000     | HB1 Issued  | 2000 -> 3000    | 3500                  | Send Heartbeat |
+| 2000     | HB2 Issued  | 2000 -> 3000    | 2500                  | Send Heartbeat |
+| 3000     | HB3 Issued  | 2000 -> 3000    | 1500                  | Send Heartbeat |
+| 4000     | HB4 Issued  | 2000 -> 3000    | 500                   | Send Heartbeat |
+| 4500     | HB Expires  | 2500            | 0                     | Stop Heartbeats |
+| 7000     | Termination | -               | -                     | Instance Terminates |
+
+Note: The instance can terminate earlier if its pods finish draining and are ready for termination.
+
+##### Example Helm Command
+
+```sh
+helm upgrade --install aws-node-termination-handler \
+  --namespace kube-system \
+  --set enableSqsTerminationDraining=true \
+  --set heartbeatInterval=1000 \
+  --set heartbeatUntil=4500 \
+  // other inputs..
+```
+
+##### Important Notes
+
+- Be aware of global timeout. Instances cannot remain in a wait state indefinitely. The global timeout is 48 hours or 100 times the heartbeat timeout, whichever is smaller. This is the maximum amount of time that you can keep an instance in `terminating:wait` state.
+- Lifecycle heartbeats are only supported in Queue Processor mode. Setting `enableSqsTerminationDraining=false` and specifying heartbeat flags is prevented in Helm. Directly editing deployment settings to bypass this will cause NTH to fail.
+- The heartbeat interval should be sufficiently shorter than the heartbeat timeout. There's a time gap between instance startup and NTH initialization. Setting the interval just slightly smaller than or equal to the timeout causes the heartbeat timeout to expire before the first heartbeat is issued. Provide adequate buffer time for NTH to complete initialization.
+- Issuing heartbeats is part of the termination process. The maximum number of instances that NTH can handle termination concurrently is limited by the number of workers. This implies that heartbeats can only be issued for up to the number of instances specified by the `workers` flag simultaneously.
+
 ### Which one should I use?
 |                    Feature                    | IMDS Processor | Queue Processor |
 | :-------------------------------------------: | :------------: | :-------------: |
 | Spot Instance Termination Notifications (ITN) |       ✅        |        ✅        |
 |               Scheduled Events                |       ✅        |        ✅        |
 |       Instance Rebalance Recommendation       |       ✅        |        ✅        |
-|        ASG Termination Lifecycle Hooks        |       ✅        |        ✅        |
-|        AZ Rebalance Recommendation            |       ❌        |        ✅        |
+|        ASG Termination Lifecycle Hooks        |       ❌        |        ✅        |
+|     ASG Termination Lifecycle State Change    |       ✅        |        ❌        |
+|         AZ Rebalance Recommendation           |       ❌        |        ✅        |
 |         Instance State Change Events          |       ❌        |        ✅        |
+|          Issue Lifecycle Heartbeats           |       ❌        |        ✅        |
 
 ### Kubernetes Compatibility
 
-|                                      NTH Release                                      | K8s v1.30 | K8s v1.29 | K8s v1.28 | K8s v1.27 | K8s v1.26 | K8s v1.25 | K8s v1.24 | K8s v1.23 |
+|                                      NTH Release                                      | K8s v1.32 | K8s v1.31 | K8s v1.30 | K8s v1.29 | K8s v1.28 | K8s v1.27 | K8s v1.26 | K8s v1.25 |
 | :-----------------------------------------------------------------------------------: | :-------: | :-------: | :-------: | :-------: | :-------: | :-------: | :-------: | :-------: |
-|  [v1.22.1](https://github.com/aws/aws-node-termination-handler/releases/tag/v1.22.1)  |     ✅    |     ✅    |     ✅    |     ✅    |     ✅    |     ✅    |     ✅    |     ✅    |
-|  [v1.22.0](https://github.com/aws/aws-node-termination-handler/releases/tag/v1.22.0)  |     ✅    |     ✅    |     ✅    |     ✅    |     ✅    |     ✅    |     ✅    |     ✅    |
-|  [v1.21.0](https://github.com/aws/aws-node-termination-handler/releases/tag/v1.21.0)  |     ❌    |     ✅    |     ✅    |     ✅    |     ✅    |     ✅    |     ✅    |     ✅    |
-|  [v1.20.0](https://github.com/aws/aws-node-termination-handler/releases/tag/v1.20.0)  |     ❌    |     ❌    |     ✅    |     ✅    |     ✅    |     ✅    |     ✅    |     ✅    |
-|  [v1.19.0](https://github.com/aws/aws-node-termination-handler/releases/tag/v1.19.0)  |     ❌    |     ❌    |     ❌    |     ❌    |     ❌    |     ❌    |     ✅    |     ✅    |
+|  [v1.25.0](https://github.com/aws/aws-node-termination-handler/releases/tag/v1.25.0)  |     ✅    |     ✅    |     ✅    |     ✅    |     ❌    |     ❌    |     ❌    |     ❌    |
+|  [v1.24.0](https://github.com/aws/aws-node-termination-handler/releases/tag/v1.24.0)  |     ❌    |     ✅    |     ✅    |     ✅    |     ❌    |     ❌    |     ❌    |     ❌    |
+|  [v1.23.1](https://github.com/aws/aws-node-termination-handler/releases/tag/v1.23.1)  |     ❌    |     ✅    |     ✅    |     ✅    |     ❌    |     ❌    |     ❌    |     ❌    |
+|  [v1.23.0](https://github.com/aws/aws-node-termination-handler/releases/tag/v1.23.0)  |     ❌    |     ❌    |     ✅    |     ✅    |     ✅    |     ✅    |     ✅    |     ✅    |
+|  [v1.22.1](https://github.com/aws/aws-node-termination-handler/releases/tag/v1.22.1)  |     ❌    |     ❌    |     ✅    |     ✅    |     ✅    |     ✅    |     ✅    |     ✅    |
+|  [v1.22.0](https://github.com/aws/aws-node-termination-handler/releases/tag/v1.22.0)  |     ❌    |     ❌    |     ✅    |     ✅    |     ✅    |     ✅    |     ✅    |     ✅    |
+|  [v1.21.0](https://github.com/aws/aws-node-termination-handler/releases/tag/v1.21.0)  |     ❌    |     ❌    |     ❌    |     ✅    |     ✅    |     ✅    |     ✅    |     ✅    |
+|  [v1.20.0](https://github.com/aws/aws-node-termination-handler/releases/tag/v1.20.0)  |     ❌    |     ❌    |     ❌    |     ❌    |     ✅    |     ✅    |     ✅    |     ✅    |
 
 A ✅ indicates that a specific aws-node-termination-handler release has been tested with a specific Kubernetes version. A ❌ indicates that a specific aws-node-termination-handler release has not been tested with a specific Kubernetes version.
 
@@ -135,7 +213,7 @@ When using Kubernetes [Pod Security Admission](https://kubernetes.io/docs/concep
 You can use kubectl to directly add all of the above resources with the default configuration into your cluster.
 
 ```
-kubectl apply -f https://github.com/aws/aws-node-termination-handler/releases/download/v1.22.1/all-resources.yaml
+kubectl apply -f https://github.com/aws/aws-node-termination-handler/releases/download/v1.25.0/all-resources.yaml
 ```
 
 For a full list of releases and associated artifacts see our [releases page](https://github.com/aws/aws-node-termination-handler/releases).
@@ -208,7 +286,7 @@ helm upgrade --install aws-node-termination-handler \
   oci://public.ecr.aws/aws-ec2/helm/aws-node-termination-handler --version $CHART_VERSION
 ```
 
-For a full list of configuration options see our [Helm readme](https://github.com/aws/aws-node-termination-handler/blob/v1.22.1/config/helm/aws-node-termination-handler#readme).
+For a full list of configuration options see our [Helm readme](https://github.com/aws/aws-node-termination-handler/blob/v1.25.0/config/helm/aws-node-termination-handler#readme).
 
 </details>
 
@@ -498,7 +576,7 @@ helm upgrade --install aws-node-termination-handler \
   oci://public.ecr.aws/aws-ec2/helm/aws-node-termination-handler --version $CHART_VERSION
 ```
 
-For a full list of configuration options see our [Helm readme](https://github.com/aws/aws-node-termination-handler/blob/v1.22.1/config/helm/aws-node-termination-handler#readme).
+For a full list of configuration options see our [Helm readme](https://github.com/aws/aws-node-termination-handler/blob/v1.25.0/config/helm/aws-node-termination-handler#readme).
 
 #### Single Instance vs Multiple Replicas
 
@@ -523,7 +601,7 @@ Queue Processor needs an **SQS queue URL** to function; therefore, manifest chan
 Minimal Config:
 
 ```
-curl -L https://github.com/aws/aws-node-termination-handler/releases/download/v1.22.1/all-resources-queue-processor.yaml -o all-resources-queue-processor.yaml
+curl -L https://github.com/aws/aws-node-termination-handler/releases/download/v1.25.0/all-resources-queue-processor.yaml -o all-resources-queue-processor.yaml
 <open all-resources-queue-processor.yaml and update QUEUE_URL value>
 kubectl apply -f ./all-resources-queue-processor.yaml
 ```
@@ -587,6 +665,28 @@ Available Prometheus metrics:
 | `actions_node` | Number of actions per node (Deprecated: Use actions metric instead)|
 | `events_error` | Number of errors in events processing                              |
 
+The method of collecting Prometheus metrics changes depending on whether NTH is running in IMDS mode or Queue mode.
+
+> [!WARNING]
+> Both `serviceMonitor` and `podMonitor` are custom resources provided by the [Prometheus Operator](https://github.com/prometheus-operator/prometheus-operator) for seamless integration with Kubernetes services and pods. For more details, please refer to [the API reference docs](https://prometheus-operator.dev/docs/api-reference/api/) for the Prometheus Operator.
+
+In Queue mode, metrics can be collected in two ways:
+- Use a `serviceMonitor` custom resource with the Prometheus Operator to collect metrics.
+- Alternatively, add aws-node-termination-handler service address statically in Prometheus `scrape_configs`.
+
+Example `scrape_configs` in prometheus helm chart:
+```yaml
+# charts/prometheus/values.yaml
+# See: https://github.com/prometheus-community/helm-charts/blob/main/charts/prometheus/values.yaml
+extraScrapeConfigs: |
+  - job_name: 'aws-node-termination-handler'
+    static_configs:
+      - targets:
+          - 'aws-node-termination-handler.kube-system.svc.cluster.local:9092'
+```
+
+In IMDS mode, metrics can be collected as follows:
+- Use a `podMonitor` custom resource with the Prometheus Operator to collect metrics.
 
 ## Communication
 * If you've run into a bug or have a new feature request, please open an [issue](https://github.com/aws/aws-node-termination-handler/issues/new).
@@ -598,4 +698,3 @@ Contributions are welcome! Please read our [guidelines](https://github.com/aws/a
 
 ## License
 This project is licensed under the Apache-2.0 License.
-

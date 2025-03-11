@@ -54,7 +54,7 @@ const (
 	enableSpotInterruptionDrainingConfigKey = "ENABLE_SPOT_INTERRUPTION_DRAINING"
 	enableSpotInterruptionDrainingDefault   = true
 	enableASGLifecycleDrainingConfigKey     = "ENABLE_ASG_LIFECYCLE_DRAINING"
-	enableASGLifecycleDrainingDefault       = true
+	enableASGLifecycleDrainingDefault       = false
 	enableSQSTerminationDrainingConfigKey   = "ENABLE_SQS_TERMINATION_DRAINING"
 	enableSQSTerminationDrainingDefault     = false
 	enableRebalanceMonitoringConfigKey      = "ENABLE_REBALANCE_MONITORING"
@@ -77,6 +77,8 @@ const (
 	taintNode                               = "TAINT_NODE"
 	taintEffectDefault                      = "NoSchedule"
 	taintEffect                             = "TAINT_EFFECT"
+	enableOutOfServiceTaintConfigKey        = "ENABLE_OUT_OF_SERVICE_TAINT"
+	enableOutOfServiceTaintDefault          = false
 	excludeFromLoadBalancers                = "EXCLUDE_FROM_LOAD_BALANCERS"
 	jsonLoggingConfigKey                    = "JSON_LOGGING"
 	jsonLoggingDefault                      = false
@@ -112,6 +114,9 @@ const (
 	queueURLConfigKey                         = "QUEUE_URL"
 	completeLifecycleActionDelaySecondsKey    = "COMPLETE_LIFECYCLE_ACTION_DELAY_SECONDS"
 	deleteSqsMsgIfNodeNotFoundKey             = "DELETE_SQS_MSG_IF_NODE_NOT_FOUND"
+	// heartbeat
+	heartbeatIntervalKey = "HEARTBEAT_INTERVAL"
+	heartbeatUntilKey    = "HEARTBEAT_UNTIL"
 )
 
 // Config arguments set via CLI, environment variables, or defaults
@@ -146,6 +151,7 @@ type Config struct {
 	CordonOnly                          bool
 	TaintNode                           bool
 	TaintEffect                         string
+	EnableOutOfServiceTaint             bool
 	ExcludeFromLoadBalancers            bool
 	JsonLogging                         bool
 	LogLevel                            string
@@ -166,6 +172,8 @@ type Config struct {
 	CompleteLifecycleActionDelaySeconds int
 	DeleteSqsMsgIfNodeNotFound          bool
 	UseAPIServerCacheToListPods         bool
+	HeartbeatInterval                   int
+	HeartbeatUntil                      int
 }
 
 // ParseCliArgs parses cli arguments and uses environment variables as fallback values
@@ -210,6 +218,7 @@ func ParseCliArgs() (config Config, err error) {
 	flag.BoolVar(&config.CordonOnly, "cordon-only", getBoolEnv(cordonOnly, false), "If true, nodes will be cordoned but not drained when an interruption event occurs.")
 	flag.BoolVar(&config.TaintNode, "taint-node", getBoolEnv(taintNode, false), "If true, nodes will be tainted when an interruption event occurs.")
 	flag.StringVar(&config.TaintEffect, "taint-effect", getEnv(taintEffect, taintEffectDefault), "Sets the effect when a node is tainted.")
+	flag.BoolVar(&config.EnableOutOfServiceTaint, "enable-out-of-service-taint", getBoolEnv(enableOutOfServiceTaintConfigKey, enableOutOfServiceTaintDefault), "If true, nodes will be tainted as out-of-service after we cordon/drain the nodes when an interruption event occurs.")
 	flag.BoolVar(&config.ExcludeFromLoadBalancers, "exclude-from-load-balancers", getBoolEnv(excludeFromLoadBalancers, false), "If true, nodes will be marked for exclusion from load balancers when an interruption event occurs.")
 	flag.BoolVar(&config.JsonLogging, "json-logging", getBoolEnv(jsonLoggingConfigKey, jsonLoggingDefault), "If true, use JSON-formatted logs instead of human readable logs.")
 	flag.StringVar(&config.LogLevel, "log-level", getEnv(logLevelConfigKey, logLevelDefault), "Sets the log level (INFO, DEBUG, or ERROR)")
@@ -230,6 +239,8 @@ func ParseCliArgs() (config Config, err error) {
 	flag.IntVar(&config.CompleteLifecycleActionDelaySeconds, "complete-lifecycle-action-delay-seconds", getIntEnv(completeLifecycleActionDelaySecondsKey, -1), "Delay completing the Autoscaling lifecycle action after a node has been drained.")
 	flag.BoolVar(&config.DeleteSqsMsgIfNodeNotFound, "delete-sqs-msg-if-node-not-found", getBoolEnv(deleteSqsMsgIfNodeNotFoundKey, false), "If true, delete SQS Messages from the SQS Queue if the targeted node(s) are not found.")
 	flag.BoolVar(&config.UseAPIServerCacheToListPods, "use-apiserver-cache", getBoolEnv(useAPIServerCache, false), "If true, leverage the k8s apiserver's index on pod's spec.nodeName to list pods on a node, instead of doing an etcd quorum read.")
+	flag.IntVar(&config.HeartbeatInterval, "heartbeat-interval", getIntEnv(heartbeatIntervalKey, -1), "The time period in seconds between consecutive heartbeat signals. Valid range: 30-3600 seconds (30 seconds to 1 hour).")
+	flag.IntVar(&config.HeartbeatUntil, "heartbeat-until", getIntEnv(heartbeatUntilKey, -1), "The duration in seconds over which heartbeat signals are sent. Valid range: 60-172800 seconds (1 minute to 48 hours).")
 	flag.Parse()
 
 	if isConfigProvided("pod-termination-grace-period", podTerminationGracePeriodConfigKey) && isConfigProvided("grace-period", gracePeriodConfigKey) {
@@ -274,6 +285,27 @@ func ParseCliArgs() (config Config, err error) {
 		panic("You must provide a node-name to the CLI or NODE_NAME environment variable.")
 	}
 
+	// heartbeat value boundary and compability check
+	if !config.EnableSQSTerminationDraining && (config.HeartbeatInterval != -1 || config.HeartbeatUntil != -1) {
+		return config, fmt.Errorf("currently using IMDS mode. Heartbeat is only supported for Queue Processor mode")
+	}
+	if config.HeartbeatInterval != -1 && (config.HeartbeatInterval < 30 || config.HeartbeatInterval > 3600) {
+		return config, fmt.Errorf("invalid heartbeat-interval passed: %d  Should be between 30 and 3600 seconds", config.HeartbeatInterval)
+	}
+	if config.HeartbeatUntil != -1 && (config.HeartbeatUntil < 60 || config.HeartbeatUntil > 172800) {
+		return config, fmt.Errorf("invalid heartbeat-until passed: %d  Should be between 60 and 172800 seconds", config.HeartbeatUntil)
+	}
+	if config.HeartbeatInterval == -1 && config.HeartbeatUntil != -1 {
+		return config, fmt.Errorf("invalid heartbeat configuration: heartbeat-interval is required when heartbeat-until is set")
+	}
+	if config.HeartbeatInterval != -1 && config.HeartbeatUntil == -1 {
+		config.HeartbeatUntil = 172800
+		log.Info().Msgf("Since heartbeat-until is not set, defaulting to %d seconds", config.HeartbeatUntil)
+	}
+	if config.HeartbeatInterval != -1 && config.HeartbeatUntil != -1 && config.HeartbeatInterval > config.HeartbeatUntil {
+		return config, fmt.Errorf("invalid heartbeat configuration: heartbeat-interval should be less than or equal to heartbeat-until")
+	}
+
 	// client-go expects these to be set in env vars
 	os.Setenv(kubernetesServiceHostConfigKey, config.KubernetesServiceHost)
 	os.Setenv(kubernetesServicePortConfigKey, config.KubernetesServicePort)
@@ -316,6 +348,7 @@ func (c Config) PrintJsonConfigArgs() {
 		Bool("cordon_only", c.CordonOnly).
 		Bool("taint_node", c.TaintNode).
 		Str("taint_effect", c.TaintEffect).
+		Bool("enable_out_of_service_taint", c.EnableOutOfServiceTaint).
 		Bool("exclude_from_load_balancers", c.ExcludeFromLoadBalancers).
 		Bool("json_logging", c.JsonLogging).
 		Str("log_level", c.LogLevel).
@@ -332,6 +365,8 @@ func (c Config) PrintJsonConfigArgs() {
 		Str("ManagedTag", c.ManagedTag).
 		Bool("use_provider_id", c.UseProviderId).
 		Bool("use_apiserver_cache", c.UseAPIServerCacheToListPods).
+		Int("heartbeat_interval", c.HeartbeatInterval).
+		Int("heartbeat_until", c.HeartbeatUntil).
 		Msg("aws-node-termination-handler arguments")
 }
 
@@ -365,6 +400,7 @@ func (c Config) PrintHumanConfigArgs() {
 			"\tcordon-only: %t,\n"+
 			"\ttaint-node: %t,\n"+
 			"\ttaint-effect: %s,\n"+
+			"\tenable-out-of-service-taint: %t,\n"+
 			"\texclude-from-load-balancers: %t,\n"+
 			"\tjson-logging: %t,\n"+
 			"\tlog-level: %s,\n"+
@@ -383,7 +419,9 @@ func (c Config) PrintHumanConfigArgs() {
 			"\tmanaged-tag: %s,\n"+
 			"\tuse-provider-id: %t,\n"+
 			"\taws-endpoint: %s,\n"+
-			"\tuse-apiserver-cache: %t,\n",
+			"\tuse-apiserver-cache: %t,\n"+
+			"\theartbeat-interval: %d,\n"+
+			"\theartbeat-until: %d\n",
 		c.DryRun,
 		c.NodeName,
 		c.PodName,
@@ -405,6 +443,7 @@ func (c Config) PrintHumanConfigArgs() {
 		c.CordonOnly,
 		c.TaintNode,
 		c.TaintEffect,
+		c.EnableOutOfServiceTaint,
 		c.ExcludeFromLoadBalancers,
 		c.JsonLogging,
 		c.LogLevel,
@@ -424,6 +463,8 @@ func (c Config) PrintHumanConfigArgs() {
 		c.UseProviderId,
 		c.AWSEndpoint,
 		c.UseAPIServerCacheToListPods,
+		c.HeartbeatInterval,
+		c.HeartbeatUntil,
 	)
 }
 
